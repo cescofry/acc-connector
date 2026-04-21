@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import socket
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -168,6 +168,7 @@ class ACCConnectorApp(App):
         self.query_one("#status-bar", Static).update(msg)
 
     @on(Button.Pressed, "#btn-add")
+    @work
     async def action_add_server(self) -> None:
         result = await self.push_screen_wait(AddServerModal())
         if result is None:
