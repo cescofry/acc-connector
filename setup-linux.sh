@@ -1,21 +1,27 @@
 #!/bin/bash
 # =============================================================================
-#  ACC Connector - Linux Setup Script (for Bazzite / Fedora-based distros)
+#  ACC Connector - Linux Setup Script
 # =============================================================================
-#  This script automates the setup of ACC Connector on Linux by running the
-#  Windows binaries inside ACC's Proton (Wine) prefix.
+#  Supports: Bazzite, Fedora, Arch, Debian/Ubuntu, openSUSE, and any other
+#  distribution where Steam is installed (native, Flatpak, or snap).
 #
 #  What this script does:
 #   1. Checks prerequisites (Steam, ACC, required tools)
 #   2. Downloads the latest ACC Connector Windows release from GitHub
-#   3. Deploys the hook DLL into ACC's game directory inside Proton
-#   4. Sets up a Proton runtime for the GUI inside ACC's Proton prefix
-#   5. Creates launch scripts & desktop integration
+#   3. Extracts the binaries from the Inno Setup installer
+#   4. Deploys the hook DLL into ACC's game directory
+#   5. Creates launch scripts and desktop integration
 #   6. Registers the acc-connect:// protocol handler
 #
+#  Why the GUI runs in ACC's Proton prefix:
+#   ACC runs through Steam Proton (Wine). The hook DLL injected into ACC
+#   communicates with the GUI via a Windows named pipe. Named pipes are
+#   isolated per Wine prefix — both components must share ACC's compatdata
+#   directory for IPC to work.
+#
 #  What you may need to do manually:
-#   - If the Proton runtime doesn't support WinForms properly, you'll need
-#     to install dotnet8 in the prefix (instructions provided at the end)
+#   - If the build is not self-contained, install dotnet8 in the prefix
+#     (instructions are printed at the end if needed)
 # =============================================================================
 
 set -euo pipefail
@@ -37,15 +43,19 @@ step()    { echo -e "\n${BLUE}==>${NC} ${YELLOW}$*${NC}"; }
 REPO="lonemeow/acc-connector"
 ACC_APPID=805550
 ACC_CONNECTOR_HOME="${HOME}/.local/share/acc-connector"
+DOTNET_NEEDED=false   # Updated by extract_installer based on DLL count
 
-# Locate Steam/Proton paths
+# =============================================================================
+# find_steam_paths — locate Steam installation and ACC Proton prefix
+# =============================================================================
 find_steam_paths() {
-    # Try common Steam locations
+    # Covers: native Steam, Flatpak Steam (two symlink layouts), snap Steam
     local steam_dirs=(
-        "${HOME}/.steam/steam"
-        "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam"
         "${HOME}/.local/share/Steam"
+        "${HOME}/.steam/steam"
         "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam"
+        "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam"
+        "${HOME}/snap/steam/common/.steam/steam"
     )
     for d in "${steam_dirs[@]}"; do
         if [[ -d "$d" ]]; then
@@ -54,9 +64,14 @@ find_steam_paths() {
             break
         fi
     done
+
     if [[ -z "${STEAM_DIR:-}" ]]; then
-        error "Could not find Steam installation."
-        error "Please set STEAM_DIR manually in this script."
+        error "Could not find a Steam installation. Searched:"
+        for d in "${steam_dirs[@]}"; do
+            error "  $d"
+        done
+        error ""
+        error "Set STEAM_DIR manually at the top of this script if Steam is elsewhere."
         exit 1
     fi
 
@@ -72,79 +87,78 @@ find_steam_paths() {
     fi
     success "Found ACC Proton prefix at $ACC_PREFIX"
 
-    # Find Proton binary
-    local proton_dirs=(
+    # Find Proton — check all known locations across all Steam install types
+    local proton_search=(
         "${STEAM_DIR}/steamapps/common/Proton"*
-        "${STEAM_DIR}/compatibilitytools.d/Proton"*
-        "${HOME}/.steam/root/compatibilitytools.d/Proton"*
+        "${STEAM_DIR}/compatibilitytools.d/"*
+        "${HOME}/.steam/root/compatibilitytools.d/"*
+        "${HOME}/.local/share/Steam/compatibilitytools.d/"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Proton"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/"*
     )
     PROTON_BIN=""
-    for pd in "${proton_dirs[@]}"; do
-        # Expand globs
+    for pd in "${proton_search[@]}"; do
         for d in $pd; do
+            [[ -d "$d" ]] || continue
             if [[ -f "$d/proton" ]]; then
                 PROTON_BIN="$d/proton"
-                break 3
+                break 2
             fi
         done
     done
+
     if [[ -z "$PROTON_BIN" ]]; then
-        warn "Could not automatically find Proton binary."
-        warn "Will search in common locations at launch time."
-        PROTON_BIN=""  # Will be resolved at runtime
+        warn "Could not automatically find a Proton binary. Will retry at launch time."
     else
-        # Get just the directory name for display
         local proton_ver
         proton_ver=$(basename "$(dirname "$PROTON_BIN")")
         success "Found Proton: ${proton_ver}"
     fi
 }
 
-# Check prerequisites
+# =============================================================================
+# check_prerequisites — verify required tools are present
+# =============================================================================
 check_prerequisites() {
     step "Step 1: Checking prerequisites"
 
     local missing=()
-
-    if ! command -v curl &>/dev/null; then missing+=("curl"); fi
-    if ! command -v jq &>/dev/null; then missing+=("jq"); fi
-    if ! command -v unzip &>/dev/null; then missing+=("unzip"); fi
+    if ! command -v curl    &>/dev/null; then missing+=("curl");    fi
+    if ! command -v jq      &>/dev/null; then missing+=("jq");      fi
     if ! command -v python3 &>/dev/null; then missing+=("python3"); fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing required packages: ${missing[*]}"
         echo ""
-        echo "On Bazzite / Fedora, install them with:"
-        echo "  sudo dnf install curl jq unzip python3"
+        echo "Install with your package manager:"
+        echo "  Fedora / Bazzite:  sudo dnf install ${missing[*]}"
+        echo "  Arch / Manjaro:    sudo pacman -S ${missing[*]}"
+        echo "  Debian / Ubuntu:   sudo apt-get install ${missing[*]}"
+        echo "  openSUSE:          sudo zypper install ${missing[*]}"
         echo ""
-        echo "On Arch-based (non-Bazzite):"
-        echo "  sudo pacman -S curl jq unzip python3"
         exit 1
     fi
     success "All prerequisites found"
 
     find_steam_paths
 
-    # Verify ACC is installed (check for appmanifest file)
-    local acc_manifest=""
+    # Verify ACC appmanifest (informational only)
     local acc_manifests=(
         "${STEAM_DIR}/steamapps/appmanifest_${ACC_APPID}.acf"
         "${STEAM_DIR}/steamapps/compatdata/${ACC_APPID}"
     )
+    local found_manifest=false
     for m in "${acc_manifests[@]}"; do
-        if [[ -e "$m" ]]; then
-            acc_manifest="$m"
-            break
-        fi
+        [[ -e "$m" ]] && found_manifest=true && break
     done
-
-    if [[ -z "$acc_manifest" ]]; then
-        warn "No appmanifest found for ACC (App ID ${ACC_APPID})"
-        warn "This is fine if you launched ACC at least once via Proton."
+    if [[ "$found_manifest" == "false" ]]; then
+        warn "ACC appmanifest not found — this is OK if ACC was launched via Proton at least once."
     fi
 }
 
-# Download latest release
+# =============================================================================
+# download_release — fetch the latest Windows installer from GitHub
+# =============================================================================
 download_release() {
     step "Step 2: Downloading ACC Connector release"
 
@@ -161,19 +175,20 @@ download_release() {
         error "Failed to get latest release tag from GitHub."
         error "Response: $(echo "$release_json" | jq -r '.message // "unknown error"')"
         echo ""
-        echo "You can manually download the installer from:"
+        echo "You can manually download from:"
         echo "  https://github.com/${REPO}/releases"
-        echo "Then extract it manually and re-run this script."
+        echo "Place the installer at: ${ACC_CONNECTOR_HOME}/ACC-Connector-Setup.exe"
+        echo "Then re-run this script."
         exit 1
     fi
     info "Latest version: $tag_name"
 
-    # Find the installer asset
     local installer_url
-    installer_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("Setup.*\\.exe$")) | .browser_download_url' | head -1)
+    installer_url=$(echo "$release_json" | jq -r \
+        '.assets[] | select(.name | test("Setup.*\\.exe$")) | .browser_download_url' | head -1)
 
     if [[ -z "$installer_url" || "$installer_url" == "null" ]]; then
-        error "No installer EXE found in the release."
+        error "No installer EXE found in the release assets."
         echo "Available assets:"
         echo "$release_json" | jq -r '.assets[].name'
         exit 1
@@ -193,10 +208,10 @@ download_release() {
     fi
 
     info "Downloading $installer_url ..."
-    curl -L -o "$installer_file" "$installer_url"
+    curl -L --progress-bar -o "$installer_file" "$installer_url"
 
     if [[ ! -f "$installer_file" ]]; then
-        error "Download failed."
+        error "Download failed — installer not found after download."
         exit 1
     fi
 
@@ -205,7 +220,9 @@ download_release() {
     echo "$tag_name" > "$version_file"
 }
 
-# Extract files from the Inno Setup installer (without running it)
+# =============================================================================
+# extract_installer — unpack the Inno Setup installer with innoextract
+# =============================================================================
 extract_installer() {
     step "Step 3: Extracting files from installer"
 
@@ -214,219 +231,215 @@ extract_installer() {
 
     mkdir -p "$extract_dir"
 
-    # Check if the GUI EXE already exists (may have been extracted before)
-    local gui_exe
-    gui_exe=$(find "$extract_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
-    if [[ -n "$gui_exe" ]]; then
+    # Skip if both required files are already present
+    local gui_already hook_already
+    gui_already=$(find "$extract_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
+    hook_already=$(find "$extract_dir" -name "client-hooks.dll"  -type f 2>/dev/null | head -1)
+    if [[ -n "$gui_already" && -n "$hook_already" ]]; then
         info "Files already extracted. Skipping."
+        _check_dll_count "$extract_dir"
         return
     fi
 
-    # Try to install innoextract if not available
+    if [[ ! -f "$installer_file" ]]; then
+        warn "Installer not found at $installer_file"
+        warn "Run this script again without removing the downloaded installer,"
+        warn "or download it manually from https://github.com/${REPO}/releases"
+        return
+    fi
+
+    # Try to install innoextract automatically if missing
     if ! command -v innoextract &>/dev/null; then
         info "innoextract not found. Attempting to install it..."
-
-        # Try system package manager first
-        if command -v dnf &>/dev/null; then
-            sudo dnf install -y innoextract 2>/dev/null || true
-        elif command -v apt-get &>/dev/null; then
-            sudo apt-get install -y innoextract 2>/dev/null || true
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm innoextract 2>/dev/null || true
-        fi
-
-        # Fall back to pip
-        if ! command -v innoextract &>/dev/null; then
-            pip3 install innoextract 2>/dev/null || pip install innoextract 2>/dev/null || true
+        if   command -v dnf     &>/dev/null; then sudo dnf     install -y innoextract 2>/dev/null || true
+        elif command -v apt-get &>/dev/null; then sudo apt-get install -y innoextract 2>/dev/null || true
+        elif command -v pacman  &>/dev/null; then sudo pacman  -S --noconfirm innoextract 2>/dev/null || true
+        elif command -v zypper  &>/dev/null; then sudo zypper  install -y innoextract 2>/dev/null || true
         fi
     fi
 
     if command -v innoextract &>/dev/null; then
-        info "Extracting files from Inno Setup installer using innoextract..."
+        info "Extracting via innoextract..."
         local temp_dir="${ACC_CONNECTOR_HOME}/_temp"
         mkdir -p "$temp_dir"
 
         if innoextract -q "$installer_file" -d "$temp_dir" 2>/dev/null; then
-            # Copy relevant files from the extracted tree to the flat app dir
-            info "Extraction successful. Reorganizing files..."
-
-            # Copy ACC Connector.exe
-            find "$temp_dir" -name "ACC Connector.exe" -exec cp {} "$extract_dir/" \; 2>/dev/null || true
-
-            # Copy all DLLs (including client-hooks.dll)
-            find "$temp_dir" -name "*.dll" -exec cp {} "$extract_dir/" \; 2>/dev/null || true
-
-            # Copy all JSON files (runtimeconfig, deps, etc.)
-            find "$temp_dir" -name "*.json" -exec cp {} "$extract_dir/" \; 2>/dev/null || true
-
-            # Copy license files
-            for f in "$temp_dir"/**/LICENSE.txt "$temp_dir"/**/THIRD_PARTY_LICENSES.txt; do
-                [[ -f "$f" ]] && cp "$f" "$extract_dir/" || true
-            done
-
-            # Clean up temp
+            info "Extraction successful. Copying files..."
+            # innoextract places {app} content into an app/ subdirectory
+            find "$temp_dir" -name "ACC Connector.exe"        -exec cp {} "$extract_dir/" \; 2>/dev/null || true
+            find "$temp_dir" -name "*.dll"                    -exec cp {} "$extract_dir/" \; 2>/dev/null || true
+            find "$temp_dir" -name "*.json"                   -exec cp {} "$extract_dir/" \; 2>/dev/null || true
+            find "$temp_dir" -name "LICENSE.txt"              -exec cp {} "$extract_dir/" \; 2>/dev/null || true
+            find "$temp_dir" -name "THIRD_PARTY_LICENSES.txt" -exec cp {} "$extract_dir/" \; 2>/dev/null || true
             rm -rf "$temp_dir"
         else
-            warn "innoextract failed. Trying to use it with --list to understand layout..."
+            warn "innoextract returned an error during extraction."
             rm -rf "$temp_dir"
         fi
     fi
 
-    # Verify extraction
-    local gui_exe_check
-    gui_exe_check=$(find "$extract_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
-    if [[ -n "$gui_exe_check" ]]; then
-        success "ACC Connector.exe found in: $extract_dir"
+    # Verify — both files are required
+    local gui_check hook_check
+    gui_check=$(find "$extract_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
+    hook_check=$(find "$extract_dir" -name "client-hooks.dll"  -type f 2>/dev/null | head -1)
+
+    if [[ -n "$gui_check" && -n "$hook_check" ]]; then
+        success "Extracted: ACC Connector.exe"
+        success "Extracted: client-hooks.dll"
+        _check_dll_count "$extract_dir"
     else
         warn ""
         warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        warn "  Could not extract the installer automatically."
-        warn "  The publisher is published as self-contained (includes all"
-        warn "  .NET runtime DLLs), so you need all files from the installer."
+        warn "  Automatic extraction incomplete."
+        [[ -z "$gui_check"  ]] && warn "  MISSING: ACC Connector.exe"
+        [[ -z "$hook_check" ]] && warn "  MISSING: client-hooks.dll"
         warn ""
-        warn "  MANUAL STEP REQUIRED:"
+        warn "  MANUAL STEP REQUIRED — choose one option:"
         warn ""
-        warn "  Option A — Try installing innoextract manually, then"
-        warn "             re-run this script:"
-        warn "      pip3 install --user innoextract"
-        warn "      innoextract \"${installer_file}\" -d \"${extract_dir}\""
+        warn "  Option A — Install innoextract, then run:"
+        warn "    Fedora:  sudo dnf install innoextract"
+        warn "    Arch:    sudo pacman -S innoextract"
+        warn "    Ubuntu:  sudo apt-get install innoextract"
+        warn "    openSUSE:sudo zypper install innoextract"
+        warn "    Then:    innoextract '${installer_file}' -d '${extract_dir}'"
+        warn "    Files land in ${extract_dir}/app/ — move them:"
+        warn "      mv '${extract_dir}/app/'* '${extract_dir}/'"
         warn ""
-        warn "  Option B — On Windows, run the installer and copy files:"
-        warn "      From: C:\\Program Files\\ACC Connector\\"
-        warn "      To:   ${extract_dir}/"
-        warn "      Copy ALL .exe, .dll, .json files + LICENSE.txt"
-        warn ""
-        warn "  Option C — Use 7z/wine to run the installer:"
-        warn "      cd ${extract_dir} && wine \"${installer_file}\" /VERYSILENT"
+        warn "  Option B — Copy from a Windows machine:"
+        warn "    Run the installer on Windows, then copy all .exe, .dll, .json"
+        warn "    files from C:\\Program Files\\ACC Connector\\"
+        warn "    to: ${extract_dir}/"
         warn ""
         warn "  After copying, re-run this script."
         warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         warn ""
-        # Don't exit — let the script continue so other steps can run
     fi
 }
 
-# Deploy the hook DLL to ACC's game directory inside Proton
+# Helper: count DLLs to determine whether the build is self-contained
+_check_dll_count() {
+    local dir="$1"
+    local dll_count
+    dll_count=$(find "$dir" -name "*.dll" -type f 2>/dev/null | wc -l)
+    if (( dll_count >= 10 )); then
+        success "Found $dll_count DLLs — build is self-contained (.NET runtime included)."
+        DOTNET_NEEDED=false
+    else
+        warn "Only $dll_count DLL(s) found — build may NOT be self-contained."
+        warn ".NET 8 runtime will likely need to be installed in the Proton prefix."
+        DOTNET_NEEDED=true
+    fi
+}
+
+# =============================================================================
+# deploy_hook — copy client-hooks.dll → ACC's game dir as hid.dll
+# =============================================================================
 deploy_hook() {
     step "Step 4: Deploying hook DLL"
 
     local app_dir="${ACC_CONNECTOR_HOME}/app"
-    local hook_dll="${app_dir}/client-hooks.dll"
+    local hook_dll
+    hook_dll=$(find "$app_dir" -name "client-hooks.dll" -type f 2>/dev/null | head -1)
 
-    # Find the hook DLL
-    if [[ ! -f "$hook_dll" ]]; then
-        # Look in subdirectories of extracted files
-        hook_dll=$(find "$app_dir" -name "client-hooks.dll" -type f 2>/dev/null | head -1)
-    fi
-
-    if [[ -z "$hook_dll" || ! -f "$hook_dll" ]]; then
-        error "Hook DLL (client-hooks.dll) not found in $app_dir"
-        error "Make sure the installer was extracted properly."
-        exit 1
+    if [[ -z "$hook_dll" ]]; then
+        error "client-hooks.dll not found in $app_dir"
+        error "Make sure Step 3 (extraction) completed successfully."
+        return 1
     fi
     success "Found hook DLL: $hook_dll"
 
-    # Find ACC's game directory inside the Proton prefix
     local acc_game_dir=""
-    local acc_search_paths=(
-        "${ACC_PREFIX}/drive_c/Program Files (x86)/Steam/steamapps/common/Assetto Corsa Competizione"
-        "${ACC_PREFIX}/drive_c/Program Files/Steam/steamapps/common/Assetto Corsa Competizione"
-        "${STEAM_DIR}/steamapps/common/Assetto Corsa Competizione"
-    )
 
-    # Also try reading the VDF manifest for the actual install directory name
+    # 1. Parse libraryfolders.vdf to search every Steam library
     local vdf_path="${STEAM_DIR}/steamapps/libraryfolders.vdf"
     if [[ -f "$vdf_path" ]]; then
-        info "Looking for ACC in Steam libraries..."
-        # Simple grep approach for finding ACC in libraryfolders
-        local acc_path_native
-        acc_path_native=$(python3 -c "
-import re
-with open('${vdf_path}', 'r') as f:
-    content = f.read()
-# Extract all library paths
-paths = re.findall(r'\"path\"\s+\"([^\"]+)\"', content)
-for p in paths:
-    print(p)
-" 2>/dev/null)
-        if [[ -n "$acc_path_native" ]]; then
+        info "Searching Steam library folders for ACC..."
+        local library_paths
+        library_paths=$(python3 - <<PYEOF 2>/dev/null
+import re, sys
+try:
+    content = open('${vdf_path}', encoding='utf-8').read()
+    for p in re.findall(r'"path"\s+"([^"]+)"', content):
+        print(p)
+except Exception as e:
+    sys.stderr.write(str(e) + '\n')
+PYEOF
+)
+        if [[ -n "$library_paths" ]]; then
             while IFS= read -r lib; do
                 local candidate="${lib}/steamapps/common"
-                if [[ -d "$candidate" ]]; then
-                    for dir in "$candidate"/*; do
-                        if [[ -d "$dir" ]] && [[ -f "$dir/AC2/Binaries/Win64/AC2-Win64-Shipping.exe" ]]; then
-                            acc_game_dir="$dir"
-                            break 2
-                        fi
-                    done
-                fi
-            done <<< "$acc_path_native"
+                [[ -d "$candidate" ]] || continue
+                for dir in "$candidate"/*/; do
+                    [[ -d "$dir" ]] || continue
+                    if [[ -f "${dir}AC2/Binaries/Win64/AC2-Win64-Shipping.exe" ]]; then
+                        acc_game_dir="${dir%/}"
+                        break 2
+                    fi
+                done
+            done <<< "$library_paths"
         fi
     fi
 
-    # If native path found, prefer it (Proton maps Z: to / by default)
+    # 2. Well-known native Steam library paths as fallback
     if [[ -z "$acc_game_dir" ]]; then
-        for p in "${acc_search_paths[@]}"; do
-            if [[ -d "$p" ]] && [[ -f "$p/AC2/Binaries/Win64/AC2-Win64-Shipping.exe" ]]; then
+        local fallbacks=(
+            "${STEAM_DIR}/steamapps/common/Assetto Corsa Competizione"
+            "${HOME}/.steam/steam/steamapps/common/Assetto Corsa Competizione"
+            "${HOME}/.local/share/Steam/steamapps/common/Assetto Corsa Competizione"
+        )
+        for p in "${fallbacks[@]}"; do
+            if [[ -f "$p/AC2/Binaries/Win64/AC2-Win64-Shipping.exe" ]]; then
                 acc_game_dir="$p"
                 break
             fi
         done
     fi
 
+    # 3. Last resort: search inside the Proton prefix (slow but thorough)
     if [[ -z "$acc_game_dir" ]]; then
-        warn "Could not automatically find ACC install directory."
-        warn "Searching inside Proton prefix..."
-
+        warn "Searching inside the Proton prefix (this may take a moment)..."
         local found
-        found=$(find "${ACC_PREFIX}/drive_c" -path "*/AC2/Binaries/Win64/AC2-Win64-Shipping.exe" -type f 2>/dev/null | head -1)
+        found=$(find "${ACC_PREFIX}/drive_c" \
+            -name "AC2-Win64-Shipping.exe" -type f 2>/dev/null | head -1)
         if [[ -n "$found" ]]; then
             acc_game_dir="$(dirname "$(dirname "$(dirname "$(dirname "$found")")")")"
-            success "Found ACC at: $acc_game_dir"
+            success "Found ACC inside Proton prefix: $acc_game_dir"
         fi
     fi
 
     if [[ -z "$acc_game_dir" ]]; then
         warn ""
         warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        warn "  Could not locate ACC install directory automatically."
+        warn "  Could not locate the ACC installation directory."
         warn ""
         warn "  MANUAL STEP REQUIRED:"
-        warn "  Find your ACC installation and copy the hook DLL there:"
+        warn "  Find your ACC game folder and copy the hook DLL there:"
         warn ""
         warn "    cp '${hook_dll}' '<ACC_DIR>/AC2/Binaries/Win64/hid.dll'"
         warn ""
-        warn "  Where <ACC_DIR> is the path that contains 'AC2/Binaries/Win64/'."
-        warn "  Common locations:"
-        warn "    - Inside Proton prefix: ${ACC_PREFIX}/drive_c/Program Files*/Steam/steamapps/common/*ACC*"
-        warn "    - Native Steam library: ${HOME}/.steam/steam/steamapps/common"
-        warn ""
-        warn "  After copying, re-run this script to continue."
+        warn "  <ACC_DIR> typically contains a folder called 'AC2'."
+        warn "  Common location:"
+        warn "    ${STEAM_DIR}/steamapps/common/Assetto Corsa Competizione"
         warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        warn ""
-
-        # Save the found path for the user
-        ACC_GAME_DIR=$(echo "$acc_game_dir" || echo "")
-        echo "$ACC_GAME_DIR" > "${ACC_CONNECTOR_HOME}/.acc_path"
+        echo "" > "${ACC_CONNECTOR_HOME}/.acc_path"
         return 1
     fi
 
-    # Now copy the hook DLL as hid.dll
     local hid_dll_path="${acc_game_dir}/AC2/Binaries/Win64/hid.dll"
 
-    # Backup existing hid.dll if it's the real one (not our hook)
+    # Check if our version is already installed
     if [[ -f "$hid_dll_path" ]]; then
         local hash_ours hash_existing
-        hash_ours=$(md5sum "$hook_dll" 2>/dev/null | cut -d' ' -f1)
-        hash_existing=$(md5sum "$hid_dll_path" 2>/dev/null | cut -d' ' -f1)
+        hash_ours=$(md5sum "$hook_dll" | cut -d' ' -f1)
+        hash_existing=$(md5sum "$hid_dll_path" | cut -d' ' -f1)
         if [[ "$hash_ours" == "$hash_existing" ]]; then
-            success "Hook DLL already installed: $hid_dll_path"
+            success "Hook DLL already installed and up-to-date: $hid_dll_path"
             ACC_GAME_DIR="$acc_game_dir"
             echo "$ACC_GAME_DIR" > "${ACC_CONNECTOR_HOME}/.acc_path"
             return
         fi
-        info "Backing up existing hid.dll as hid.dll.bak"
-        cp "$hid_dll_path" "${hid_dll_path}.bak" 2>/dev/null || true
+        info "Backing up existing hid.dll → hid.dll.bak"
+        cp "$hid_dll_path" "${hid_dll_path}.bak"
     fi
 
     cp "$hook_dll" "$hid_dll_path"
@@ -435,185 +448,265 @@ for p in paths:
     echo "$ACC_GAME_DIR" > "${ACC_CONNECTOR_HOME}/.acc_path"
 }
 
-# Find the Proton binary (runtime resolution)
+# =============================================================================
+# find_proton — locate the Proton binary (used during setup for display)
+# =============================================================================
 find_proton() {
     if [[ -n "${PROTON_BIN:-}" ]] && [[ -f "$PROTON_BIN" ]]; then
         echo "$PROTON_BIN"
         return
     fi
 
-    local proton_dirs=(
+    local proton_search=(
         "${STEAM_DIR}/steamapps/common/Proton"*
         "${STEAM_DIR}/compatibilitytools.d/"*
         "${HOME}/.steam/root/compatibilitytools.d/"*
+        "${HOME}/.local/share/Steam/compatibilitytools.d/"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Proton"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/"*
     )
-
-    for pattern in "${proton_dirs[@]}"; do
-        for d in $pattern; do
-            if [[ -f "$d/proton" ]]; then
-                PROTON_BIN="$d/proton"
-                echo "$PROTON_BIN"
-                return
-            fi
-        done
-    done
-
-    warn "Proton binary not found."
-    warn "You may need to set it manually before launching."
-}
-
-# Create the launch script
-create_launcher() {
-    step "Step 5: Creating launch scripts"
-
-    local launch_script="${ACC_CONNECTOR_HOME}/acc-connector.sh"
-    local app_dir="${ACC_CONNECTOR_HOME}/app"
-
-    # Find the GUI executable
-    local gui_exe
-    gui_exe=$(find "$app_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
-
-    if [[ -z "$gui_exe" ]]; then
-        warn "GUI executable not found in $app_dir"
-        warn "This might be in a subdirectory - check and update the launch script."
-        gui_exe="${app_dir}/ACC Connector.exe"
-    fi
-
-    cat > "$launch_script" <<'LAUNCHSCRIPT'
-#!/bin/bash
-# ACC Connector launcher script
-# Runs the Windows GUI inside ACC's Proton prefix for proper IPC
-
-ACC_APPID=805550
-
-# Try to determine Steam directory
-for candidate in "${HOME}/.local/share/Steam" "${HOME}/.steam/steam" \
-                  "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam"; do
-    if [[ -d "$candidate" ]]; then
-        STEAM_DIR="$candidate"
-        break
-    fi
-done
-
-ACC_CONNECTOR_DIR="${HOME}/.local/share/acc-connector"
-APP_DIR="${ACC_CONNECTOR_DIR}/app"
-
-# Locate GUI executable
-GUI_EXE=$(find "$APP_DIR" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
-if [[ -z "$GUI_EXE" ]]; then
-    echo "ERROR: Could not find ACC Connector.exe in $APP_DIR"
-    echo "Make sure you have extracted the installer files there."
-    exit 1
-fi
-
-case "${1:-}" in
-    --uninstall-hook)
-        echo "Removing hook DLL..."
-        ACC_GAME_DIR=$(cat "${ACC_CONNECTOR_DIR}/.acc_path" 2>/dev/null || echo "")
-        if [[ -n "$ACC_GAME_DIR" ]]; then
-            rm -f "${ACC_GAME_DIR}/AC2/Binaries/Win64/hid.dll"
-            echo "Hook removed from ${ACC_GAME_DIR}/AC2/Binaries/Win64/hid.dll"
-        else
-            echo "ACC install path not known. Cannot remove hook."
-        fi
-        exit 0
-        ;;
-esac
-
-# Find Proton
-find_proton() {
-    local proton_dirs=(
-        "${STEAM_DIR}/steamapps/common/Proton"*
-        "${STEAM_DIR}/compatibilitytools.d/"*
-        "${HOME}/.steam/root/compatibilitytools.d/"*
-    )
-    for pattern in "${proton_dirs[@]}"; do
-        for d in $pattern; do
+    for pd in "${proton_search[@]}"; do
+        for d in $pd; do
+            [[ -d "$d" ]] || continue
             if [[ -f "$d/proton" ]]; then
                 echo "$d/proton"
                 return
             fi
         done
     done
+
+    warn "Proton binary not found."
+}
+
+# =============================================================================
+# create_launcher — write acc-connector.sh and test-env.sh
+# =============================================================================
+create_launcher() {
+    step "Step 5: Creating launch scripts"
+
+    local launch_script="${ACC_CONNECTOR_HOME}/acc-connector.sh"
+    local app_dir="${ACC_CONNECTOR_HOME}/app"
+
+    local gui_exe
+    gui_exe=$(find "$app_dir" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
+    if [[ -z "$gui_exe" ]]; then
+        warn "GUI executable not found in $app_dir"
+        warn "The launch script will be created but will not work until files are extracted."
+    fi
+
+    # Single-quoted heredoc: variables inside are intentionally NOT expanded here.
+    # Everything is resolved at runtime when the user runs acc-connector.sh.
+    cat > "$launch_script" <<'LAUNCHSCRIPT'
+#!/bin/bash
+# ACC Connector launcher
+#
+# Runs the Windows GUI inside ACC's Proton prefix so that the named-pipe IPC
+# between the GUI and the hook DLL (injected into the ACC process) shares the
+# same Wine prefix. This is required — named pipes are isolated per prefix.
+
+ACC_APPID=805550
+ACC_CONNECTOR_DIR="${HOME}/.local/share/acc-connector"
+APP_DIR="${ACC_CONNECTOR_DIR}/app"
+
+# ---------------------------------------------------------------------------
+# Locate Steam (native, Flatpak, snap)
+# ---------------------------------------------------------------------------
+STEAM_DIR=""
+for candidate in \
+        "${HOME}/.local/share/Steam" \
+        "${HOME}/.steam/steam" \
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam" \
+        "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam" \
+        "${HOME}/snap/steam/common/.steam/steam"; do
+    if [[ -d "$candidate" ]]; then
+        STEAM_DIR="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$STEAM_DIR" ]]; then
+    echo "ERROR: Could not find a Steam installation."
+    echo "Searched:"
+    echo "  ~/.local/share/Steam"
+    echo "  ~/.steam/steam"
+    echo "  ~/.var/app/com.valvesoftware.Steam/data/Steam"
+    echo "  ~/snap/steam/common/.steam/steam"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Locate GUI executable
+# ---------------------------------------------------------------------------
+GUI_EXE=$(find "$APP_DIR" -name "ACC Connector.exe" -type f 2>/dev/null | head -1)
+if [[ -z "$GUI_EXE" ]]; then
+    echo "ERROR: ACC Connector.exe not found in $APP_DIR"
+    echo "Re-run setup-linux.sh to extract the application files."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Handle --uninstall-hook
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    --uninstall-hook)
+        ACC_GAME_DIR=$(cat "${ACC_CONNECTOR_DIR}/.acc_path" 2>/dev/null || echo "")
+        if [[ -n "$ACC_GAME_DIR" ]] && [[ -d "$ACC_GAME_DIR" ]]; then
+            HID_PATH="${ACC_GAME_DIR}/AC2/Binaries/Win64/hid.dll"
+            if [[ -f "$HID_PATH" ]]; then
+                rm -f "$HID_PATH"
+                echo "Hook removed: ${HID_PATH}"
+            else
+                echo "Hook DLL not found at ${HID_PATH} — already removed?"
+            fi
+            if [[ -f "${HID_PATH}.bak" ]]; then
+                mv "${HID_PATH}.bak" "$HID_PATH"
+                echo "Restored original hid.dll from backup."
+            fi
+        else
+            echo "ACC install path not recorded. Cannot remove hook automatically."
+            echo "Manually delete: <ACC_DIR>/AC2/Binaries/Win64/hid.dll"
+        fi
+        exit 0
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Locate Proton binary
+# ---------------------------------------------------------------------------
+find_proton() {
+    local search=(
+        "${STEAM_DIR}/steamapps/common/Proton"*
+        "${STEAM_DIR}/compatibilitytools.d/"*
+        "${HOME}/.steam/root/compatibilitytools.d/"*
+        "${HOME}/.local/share/Steam/compatibilitytools.d/"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Proton"*
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/"*
+    )
+    for pattern in "${search[@]}"; do
+        for d in $pattern; do
+            [[ -d "$d" ]] || continue
+            if [[ -f "$d/proton" ]]; then
+                echo "$d/proton"
+                return 0
+            fi
+        done
+    done
+    return 1
 }
 
 PROTON=$(find_proton)
 if [[ -z "$PROTON" ]]; then
     echo "ERROR: Could not find Proton."
-    echo "Please install Proton via Steam (enable Steam Play for all titles)."
+    echo "In Steam: Settings → Compatibility → Enable Steam Play for all titles."
+    echo "Install at least one Proton version, then re-run this launcher."
     exit 1
 fi
 
 COMPATDATA="${STEAM_DIR}/steamapps/compatdata/${ACC_APPID}"
-
 if [[ ! -d "$COMPATDATA" ]]; then
-    echo "ERROR: ACC Proton compatdata not found at $COMPATDATA"
-    echo "Make sure ACC has been launched at least once with Proton enabled."
+    echo "ERROR: ACC Proton compatdata not found at: $COMPATDATA"
+    echo "Launch ACC via Steam at least once with Proton enabled, then retry."
     exit 1
 fi
 
-# Resolve the GUI_EXE path to its Windows path within the prefix
-# Wine maps Z: to / — so we convert the Linux path to a Z:-style Windows path
-# e.g., /home/user/.local/share/acc-connector/app/... -> Z:\home\user\...
-GUI_EXE_PATH=$(realpath "$GUI_EXE")
-WIN_PATH="Z:${GUI_EXE_PATH//\//\\}"
+# ---------------------------------------------------------------------------
+# Build the Windows path for the EXE
+# Wine maps Z: to the Linux filesystem root (/).
+#   /home/user/.local/share/acc-connector/app/ACC Connector.exe
+#   → Z:\home\user\.local\share\acc-connector\app\ACC Connector.exe
+# ---------------------------------------------------------------------------
+GUI_EXE_ABS=$(realpath "$GUI_EXE")
+WIN_PATH="Z:${GUI_EXE_ABS//\//\\}"
 
-# If the EXE is inside the Proton drive_c, use the internal C: path
-PREFIX_DRIVE_C="${COMPATDATA}/pfx/drive_c"
-if [[ "$GUI_EXE_PATH" == "${COMPATDATA}/"* ]]; then
-    # It's inside the prefix, resolve to C:\...
-    REL_PATH="${GUI_EXE_PATH#$PREFIX_DRIVE_C/}"
-    WIN_PATH="C:\\\\${REL_PATH//\//\\\\}"
-fi
-
-echo "Using Proton: $(basename "$(dirname "$PROTON")")"
+echo "Steam:       $STEAM_DIR"
+echo "Proton:      $(basename "$(dirname "$PROTON")")"
 echo "Compat data: $COMPATDATA"
-echo "GUI EXE:     $GUI_EXE_PATH"
-echo "Win Path:    $WIN_PATH"
+echo "EXE:         $GUI_EXE_ABS"
+echo ""
 
-# Launch the GUI
-STEAM_COMPAT_DATA_PATH="$COMPATDATA" \
-STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_DIR" \
-    "$PROTON" run "$WIN_PATH" ${@+"$@"}
+# ---------------------------------------------------------------------------
+# Launch — GUI runs inside ACC's Proton prefix for shared named-pipe IPC
+# ---------------------------------------------------------------------------
+export STEAM_COMPAT_DATA_PATH="$COMPATDATA"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_DIR"
+exec "$PROTON" run "$WIN_PATH" ${@+"$@"}
 LAUNCHSCRIPT
 
     chmod +x "$launch_script"
     success "Launch script created: $launch_script"
 
-    # Create a simple test script to check
+    # -------------------------------------------------------------------------
+    # test-env.sh — quick sanity-check for the user's setup
+    # -------------------------------------------------------------------------
     cat > "${ACC_CONNECTOR_HOME}/test-env.sh" <<'TESTSCRIPT'
 #!/bin/bash
-# Test the environment
-echo "=== ACC Connector Environment Test ==="
-echo "ACC Connector Home: ${HOME}/.local/share/acc-connector"
+echo "=== ACC Connector Environment Check ==="
 echo ""
 
-ACC_COMPAT="${HOME}/.local/share/Steam/steamapps/compatdata/805550"
+CONNECTOR_DIR="${HOME}/.local/share/acc-connector"
 
+# Locate Steam
+STEAM_DIR=""
+for c in \
+        "${HOME}/.local/share/Steam" \
+        "${HOME}/.steam/steam" \
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam" \
+        "${HOME}/.var/app/com.valvesoftware.Steam/.steam/steam" \
+        "${HOME}/snap/steam/common/.steam/steam"; do
+    if [[ -d "$c" ]]; then STEAM_DIR="$c"; break; fi
+done
+echo "Steam:        ${STEAM_DIR:-NOT FOUND}"
+
+# ACC Proton prefix
+ACC_COMPAT="${STEAM_DIR:-~/.local/share/Steam}/steamapps/compatdata/805550"
 if [[ -d "$ACC_COMPAT" ]]; then
-    echo "ACC Proton prefix exists at: $ACC_COMPAT"
-    echo "  - system.reg: $([[ -f "$ACC_COMPAT/pfx/system.reg" ]] && echo "YES" || echo "NO")"
-    echo "  - drive_c:    $([[ -d "$ACC_COMPAT/pfx/drive_c" ]] && echo "YES" || echo "NO")"
+    echo "ACC prefix:   $ACC_COMPAT  (OK)"
+    echo "  system.reg: $([[ -f "$ACC_COMPAT/pfx/system.reg" ]] && echo YES || echo NO)"
+    echo "  drive_c:    $([[ -d "$ACC_COMPAT/pfx/drive_c"   ]] && echo YES || echo NO)"
 else
-    echo "WARNING: ACC Proton prefix not found."
+    echo "ACC prefix:   NOT FOUND at $ACC_COMPAT"
 fi
 
+# ACC game directory recorded by setup
+ACC_GAME_DIR=$(cat "${CONNECTOR_DIR}/.acc_path" 2>/dev/null || echo "")
+echo "ACC game dir: ${ACC_GAME_DIR:-NOT RECORDED (run setup-linux.sh again)}"
+if [[ -n "$ACC_GAME_DIR" ]] && [[ -d "$ACC_GAME_DIR" ]]; then
+    HID="${ACC_GAME_DIR}/AC2/Binaries/Win64/hid.dll"
+    echo "  hid.dll:    $([[ -f "$HID" ]] && echo "INSTALLED (hook active)" || echo "NOT INSTALLED")"
+fi
+
+# Proton installations
 echo ""
-echo "Looking for Proton..."
-for pattern in "${HOME}/.local/share/Steam/steamapps/common/Proton"* \
-               "${HOME}/.local/share/Steam/compatibilitytools.d/"*; do
+echo "Proton installations:"
+found_any=false
+for pattern in \
+        "${STEAM_DIR:-~/.local/share/Steam}/steamapps/common/Proton"* \
+        "${STEAM_DIR:-~/.local/share/Steam}/compatibilitytools.d/"* \
+        "${HOME}/.steam/root/compatibilitytools.d/"* \
+        "${HOME}/.local/share/Steam/compatibilitytools.d/"* \
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Proton"* \
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/"*; do
     for d in $pattern; do
-        if [[ -f "$d/proton" ]]; then
-            echo "  Found: $(basename "$d")"
-            break
-        fi
+        [[ -f "$d/proton" ]] || continue
+        echo "  $(basename "$d")"
+        found_any=true
     done
 done
+$found_any || echo "  NONE FOUND — install Proton via Steam"
 
+# Application files
 echo ""
-echo "Looking for ACC Connector binaries..."
-ls -la "${HOME}/.local/share/acc-connector/app/"*.exe 2>/dev/null || echo "  No EXE files found in app dir"
-ls -la "${HOME}/.local/share/acc-connector/app/"*.dll 2>/dev/null | head -5 || echo "  No DLL files found"
+echo "ACC Connector files in ${CONNECTOR_DIR}/app/:"
+exe_ok=$([[ -f "${CONNECTOR_DIR}/app/ACC Connector.exe" ]] && echo "YES" || echo "NO")
+hook_ok=$([[ -f "${CONNECTOR_DIR}/app/client-hooks.dll"  ]] && echo "YES" || echo "NO")
+dll_count=$(find "${CONNECTOR_DIR}/app" -name "*.dll" -type f 2>/dev/null | wc -l)
+echo "  ACC Connector.exe: $exe_ok"
+echo "  client-hooks.dll:  $hook_ok"
+if (( dll_count >= 10 )); then
+    echo "  Total DLLs:        $dll_count  (self-contained — .NET runtime included)"
+else
+    echo "  Total DLLs:        $dll_count  (may need .NET 8 installed in Proton prefix)"
+fi
 
 echo ""
 echo "=== Done ==="
@@ -622,7 +715,9 @@ TESTSCRIPT
     success "Test script created: ${ACC_CONNECTOR_HOME}/test-env.sh"
 }
 
-# Create desktop integration
+# =============================================================================
+# create_desktop_integration — .desktop files for launcher + protocol handler
+# =============================================================================
 create_desktop_integration() {
     step "Step 6: Creating desktop integration"
 
@@ -632,7 +727,7 @@ create_desktop_integration() {
     local icon_path="${ACC_CONNECTOR_HOME}/acc-connector.png"
     local launch_script="${ACC_CONNECTOR_HOME}/acc-connector.sh"
 
-    # Desktop entry for launching the app
+    # Application launcher
     cat > "${desktop_dir}/acc-connector.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
@@ -645,7 +740,7 @@ Terminal=false
 X-GNOME-Autostart-enabled=false
 DESKTOP
 
-    # Protocol handler desktop entry
+    # acc-connect:// protocol handler
     cat > "${desktop_dir}/acc-connector-protocol.desktop" <<PROTDESKTOP
 [Desktop Entry]
 Type=Application
@@ -656,99 +751,114 @@ NoDisplay=true
 Terminal=false
 PROTDESKTOP
 
-    success "Desktop entries created"
+    success "Desktop entries created in $desktop_dir"
 }
 
-# Register protocol handler
+# =============================================================================
+# register_protocol_handler — xdg-mime acc-connect://
+# =============================================================================
 register_protocol_handler() {
-    step "Step 7: Registering acc-connect:// protocol"
+    step "Step 7: Registering acc-connect:// protocol handler"
 
     if command -v xdg-mime &>/dev/null; then
-        xdg-mime default acc-connector-protocol.desktop x-scheme-handler/acc-connect 2>/dev/null || {
-            warn "xdg-mime registration failed — this is ok, desktop file is still valid"
-        }
+        if xdg-mime default acc-connector-protocol.desktop \
+                x-scheme-handler/acc-connect 2>/dev/null; then
+            success "Protocol handler registered (acc-connect:// links will open ACC Connector)"
+        else
+            warn "xdg-mime registration failed — the .desktop file is still in place."
+            warn "Many browsers detect it automatically; or register manually with:"
+            warn "  xdg-mime default acc-connector-protocol.desktop x-scheme-handler/acc-connect"
+        fi
+    else
+        warn "xdg-utils not found — skipping automatic protocol registration."
+        warn "Install xdg-utils and run:"
+        warn "  xdg-mime default acc-connector-protocol.desktop x-scheme-handler/acc-connect"
     fi
-
-    success "Protocol handler registration attempted (acc-connect:// links should work)"
 }
 
-# Final instructions
+# =============================================================================
+# print_instructions — summary and troubleshooting at the end
+# =============================================================================
 print_instructions() {
     step "Setup Complete!"
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  ACC Connector is now set up!"
+    echo "  ACC Connector is installed!"
     echo ""
-    echo "  🚀 To launch:"
-    echo "     ${ACC_CONNECTOR_HOME}/acc-connector.sh"
+    echo "  How to use:"
+    echo "   1. Make sure Steam is running"
+    echo "   2. Launch ACC Connector:"
+    echo "        ${ACC_CONNECTOR_HOME}/acc-connector.sh"
+    echo "   3. Add servers manually, or click an acc-connect:// link in your browser"
+    echo "   4. Start ACC via Steam, then open LAN SERVERS to find the listed servers"
     echo ""
-    echo "  🧪 To test the environment:"
-    echo "     ${ACC_CONNECTOR_HOME}/test-env.sh"
+    echo "  Verify your setup:"
+    echo "      ${ACC_CONNECTOR_HOME}/test-env.sh"
     echo ""
-    echo "  📁 Config & data are stored at:"
-    echo "     ${ACC_CONNECTOR_HOME}/"
+    echo "  Uninstall the hook DLL (restore hid.dll):"
+    echo "      ${ACC_CONNECTOR_HOME}/acc-connector.sh --uninstall-hook"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
+    warn "TROUBLESHOOTING"
+    echo ""
 
-    warn ""
-    warn "IMPORTANT — Potential issues and troubleshooting:"
-    warn ""
+    if [[ "$DOTNET_NEEDED" == "true" ]]; then
+        cat <<DOTNET_WARN
+  ⚠️  .NET 8 runtime may be required
+     ──────────────────────────────────
+     The extracted build has fewer than 10 DLLs and is probably not
+     self-contained. The .NET 8 Windows runtime must be present in
+     ACC's Proton prefix for the GUI to start.
+
+     Option A — Install automatically via protontricks (if available):
+       protontricks ${ACC_APPID} dotnet80
+
+     Option B — Install manually:
+       Download the .NET 8 Desktop Runtime (win-x64) from:
+         https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+       Then run the installer through Proton:
+         export STEAM_COMPAT_DATA_PATH="${ACC_COMPATDATA:-~/.local/share/Steam/steamapps/compatdata/${ACC_APPID}}"
+         export STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_DIR:-~/.local/share/Steam}"
+         <proton_binary> run dotnet-desktop-runtime-8.0.x-win-x64.exe
+
+DOTNET_WARN
+    fi
 
     cat <<TROUBLE
+  ⚠️  GUI does not start / named pipe error
+     ─────────────────────────────────────────
+     The hook DLL (inside ACC) and the GUI communicate via a Windows
+     named pipe. Both MUST run in the same Proton prefix. The launch
+     script handles this by setting STEAM_COMPAT_DATA_PATH to ACC's
+     compatdata. Do NOT run the GUI through a separate Wine prefix.
 
-  ⚠️  Issue 1: Windows Forms (.NET) may not work in Proton/Wine
-     ───────────────────────────────────────────────────────
-     ACC Connector uses .NET 8 Windows Forms. Proton may not
-     include the .NET runtime by default. If launching fails:
+  ⚠️  Proton version compatibility
+     ─────────────────────────────────
+     Proton 9+ is recommended for the best WinForms / .NET support.
+     In Steam: right-click ACC → Properties → Compatibility →
+     Force a specific Proton version (choose 9.x or newer).
 
-     Solution A — Install dotnet in the ACC Proton prefix:
-       PROTON="\$(find ~/.local/share/Steam/steamapps/common/Proton* -name proton | head -1)"
-       WINEPREFIX="\${HOME}/.local/share/Steam/steamapps/compatdata/805550/pfx"
-       WINEPREFIX="\$WINEPREFIX" "\$PROTON" run wineboot -u
-       
-       Then download and install the .NET 8 Desktop Runtime (x64):
-       https://dotnet.microsoft.com/en-us/download/dotnet/8.0
-       Run the installer EXE through Proton in the same prefix.
+  ⚠️  Steam must be running
+     ──────────────────────────
+     Proton requires the Steam client to be open in the background.
 
-     Solution B — Use the publish output (self-contained build):
-       If the published output is truly self-contained (includes
-       all .NET DLLs), no extra .NET installation is needed.
-       Check if the publish folder has 50+ DLL files — if yes,
-       it's self-contained and should "just work".
-
-  ⚠️  Issue 2: Named pipe IPC must share the Proton prefix
-     ──────────────────────────────────────────────────────
-     The hook DLL (inside ACC process) connects to the GUI via
-     a Windows named pipe. Both MUST run in the SAME Proton
-     prefix. This script ensures that by using ACC's own
-     compatdata directory.
-
-     ✓ The launch script automatically uses ACC's compatdata.
-
-  ⚠️  Issue 3: Proton version compatibility
-     ────────────────────────────────────────
-     Proton 9+ has better WinForms/.NET support.
-     Ensure Steam Play is enabled and a recent Proton version
-     is selected for ACC.
-
-  ⚠️  Issue 4: Steam must be running
-     ───────────────────────────────
-     Proton needs the Steam client running in the background
-     for license checks and runtime dependencies.
+  ⚠️  Flatpak Steam users
+     ──────────────────────
+     The Proton binary bundled with Flatpak Steam runs inside the
+     Flatpak sandbox. If the launcher fails to find or invoke Proton,
+     try running acc-connector.sh from inside the Flatpak shell:
+       flatpak run --command=bash com.valvesoftware.Steam
+       ${ACC_CONNECTOR_HOME}/acc-connector.sh
 
 TROUBLE
 
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Enjoy direct IP racing on Linux! 🏎️"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
-# =========================================================================
-# Main execution
-# =========================================================================
-
+# =============================================================================
+# Main
+# =============================================================================
 main() {
     echo ""
     echo "  ╔══════════════════════════════════════════════════════════╗"
@@ -759,13 +869,12 @@ main() {
 
     check_prerequisites
     download_release
-    extract_installer || true  # Continue even if extraction partially works
-    deploy_hook || true       # Don't fail — user may need manual steps
+    extract_installer   || true   # continue even if extraction is partial
+    deploy_hook         || true   # continue — user may need to do this manually
     create_launcher
     create_desktop_integration
     register_protocol_handler
     print_instructions
 }
 
-# Run
 main "$@"
